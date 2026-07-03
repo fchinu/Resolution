@@ -1,4 +1,6 @@
 import argparse
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 import os
 import numpy as np
 import ROOT
@@ -77,10 +79,15 @@ def prefit_dscb(hist, func, is_mc, lo, hi, max_retries=10):
     return out
 
 
-def load_decays(path, tree_name, pt_bins, max_per_bin, seed, chunk=20_000_000):
+def load_decays(path, tree_name, pt_bins, max_per_bin, seed,
+                eta_cut, alpha_cut, qt_cut, chunk=20_000_000):
     """
         For every K0s we store: pos_pt, neg_pt, cosh(eta_pos), cosh(eta_neg)
-        and c12 = cos(dphi) + sinh(eta_pos)*sinh(eta_neg)
+        and c12 = cos(dphi) + sinh(eta_pos)*sinh(eta_neg).
+
+        Decays are kept only if the K0s passes the same selection used for the
+        data/MC signal (see signal_producer.py): |eta| < eta_cut,
+        |alpha| < alpha_cut and qt > qt_cut (Armenteros-Podolanski variables).
     """
     nbins = len(pt_bins) - 1
     edges = np.asarray(pt_bins, dtype=np.float64)
@@ -102,7 +109,7 @@ def load_decays(path, tree_name, pt_bins, max_per_bin, seed, chunk=20_000_000):
 
         # true K0s pT = |pt_pos + pt_neg| (vector sum of the two daughters)
         k0s_pt = np.sqrt(pos_pt**2 + neg_pt**2 + 2.0 * pos_pt * neg_pt * cos_dphi)
-        ibin = np.digitize(k0s_pt, edges) - 1  # -1 / nbins => out of range
+        ibin = np.digitize(pos_pt, edges) - 1  # -1 / nbins => out of range
 
         sinh_p = np.sinh(arrays["pos_eta"].astype(np.float64))
         sinh_n = np.sinh(arrays["neg_eta"].astype(np.float64))
@@ -114,6 +121,21 @@ def load_decays(path, tree_name, pt_bins, max_per_bin, seed, chunk=20_000_000):
         #         = pt1 pt2 [cos(phi1 - phi2) + sinh eta1 sinh eta2]
         # so c12 = cos(dphi) + sinh(eta1) sinh(eta2).
         c12 = cos_dphi + sinh_p * sinh_n
+
+        # --- K0s eta + Armenteros-Podolanski selection ---
+        p_p2 = (pos_pt * cosh_p) ** 2
+        p_n2 = (neg_pt * cosh_n) ** 2
+        dot_pn = pos_pt * neg_pt * c12
+        ptot2 = p_p2 + p_n2 + 2.0 * dot_pn
+
+        pz = pos_pt * sinh_p + neg_pt * sinh_n
+        eta_k0s = np.arcsinh(pz / k0s_pt)
+
+        alpha = (p_p2 - p_n2) / ptot2
+        qt = np.sqrt(np.maximum(p_p2 * ptot2 - (p_p2 + dot_pn) ** 2, 0.0)) / np.sqrt(ptot2)
+
+        keep = (np.abs(eta_k0s) < eta_cut) & (np.abs(alpha) < alpha_cut) & (qt > qt_cut)
+        ibin[~keep] = -1  # decays failing the selection get no valid bin
 
         chunk_cols = {"pos_pt": pos_pt, "neg_pt": neg_pt,
                       "cosh_p": cosh_p, "cosh_n": cosh_n, "c12": c12}
@@ -261,37 +283,193 @@ def get_background_func(func):
         bkg_func.SetParameter(i, func.GetParameter(i+7))
     return bkg_func
 
-def fit_all_bins(decays, histos, mass_min, mass_max, is_mc, outdir):
-    results = []
+def _profile_err(vals, chi2_profile, chi2_min):
+    """Estimate 1-sigma uncertainty from a chi2 profile via the delta-chi2=1 crossing."""
+    best_idx = int(np.argmin(chi2_profile))
+    target = chi2_min + 1.0
+    err_lo = err_hi = 0.0
+    for k in range(best_idx - 1, -1, -1):
+        if chi2_profile[k] >= target:
+            frac = (target - chi2_profile[k + 1]) / (chi2_profile[k] - chi2_profile[k + 1])
+            err_lo = vals[best_idx] - (vals[k + 1] + frac * (vals[k] - vals[k + 1]))
+            break
+    for k in range(best_idx + 1, len(vals)):
+        if chi2_profile[k] >= target:
+            frac = (target - chi2_profile[k - 1]) / (chi2_profile[k] - chi2_profile[k - 1])
+            err_hi = (vals[k - 1] + frac * (vals[k] - vals[k - 1])) - vals[best_idx]
+            break
+    step = float(np.diff(vals).mean())
+    return 0.5 * (err_lo + err_hi) if (err_lo > 0 or err_hi > 0) else step
+
+
+def grid_search_bin(data, counts, edges, mass_min, mass_max, is_mc, tag,
+                    n_coarse=21, n_fine=161, fine_half_steps=4):
+    lo, hi = float(edges[0]), float(edges[-1])
+    hist = to_th1(f"fit_h_{tag}", counts, edges, err_floor=1.0)
+    hist.SetDirectory(0)
+
+    func_def = ROOT.double_sided_cb if is_mc else ROOT.double_sided_cb_plus_bkg
+    npar = 7 if is_mc else 9
+    func = ROOT.TF1(f"fit_f_{tag}", func_def, lo, hi, npar)
+
+    tail_init = prefit_dscb(hist, func, is_mc, lo, hi)
+    chi2_fn, last = make_chi2(data, hist, func, mass_min, mass_max, is_mc, tail_init, lo, hi)
+
+    # --- coarse scan over the full search range ---
+    c_delta = np.linspace(-0.05, 0.05, n_coarse)
+    c_sigma = np.linspace(5e-4, 0.06, n_coarse)
+    c_grid = np.full((n_coarse, n_coarse), np.inf)
+    for i, d in enumerate(c_delta):
+        for j, s in enumerate(c_sigma):
+            c_grid[i, j] = chi2_fn([d, s])
+
+    ci, cj = np.unravel_index(int(np.argmin(c_grid)), c_grid.shape)
+    c_dd = c_delta[1] - c_delta[0]
+    c_ds = c_sigma[1] - c_sigma[0]
+
+    # --- fine scan: ±fine_half_steps coarse steps around the coarse minimum ---
+    # fine step = (2 * fine_half_steps * coarse_step) / (n_fine - 1)
+    f_delta = np.linspace(
+        np.clip(c_delta[ci] - fine_half_steps * c_dd, c_delta[0], c_delta[-1]),
+        np.clip(c_delta[ci] + fine_half_steps * c_dd, c_delta[0], c_delta[-1]),
+        n_fine,
+    )
+    f_sigma = np.linspace(
+        np.clip(c_sigma[cj] - fine_half_steps * c_ds, c_sigma[0], c_sigma[-1]),
+        np.clip(c_sigma[cj] + fine_half_steps * c_ds, c_sigma[0], c_sigma[-1]),
+        n_fine,
+    )
+    f_grid = np.full((n_fine, n_fine), np.inf)
+    for i, d in enumerate(f_delta):
+        for j, s in enumerate(f_sigma):
+            f_grid[i, j] = chi2_fn([d, s])
+
+    flat_idx = int(np.argmin(f_grid))
+    best_i, best_j = np.unravel_index(flat_idx, f_grid.shape)
+    best_delta = float(f_delta[best_i])
+    best_sigma = float(f_sigma[best_j])
+    best_chi2 = float(f_grid[best_i, best_j])
+
+    # Errors and correlation from the inverse Hessian (central finite differences).
+    # This is more reliable than the Δchi2=1 profile when the chi2 landscape is steep
+    # (i.e. total chi2 >> 1), because the Hessian uses the local curvature rather than
+    # an absolute threshold that would otherwise fall within a fraction of one grid step.
+    delta_err = sigma_err = corr = 0.0
+    if 0 < best_i < n_fine - 1 and 0 < best_j < n_fine - 1:
+        dd = f_delta[1] - f_delta[0]
+        ds = f_sigma[1] - f_sigma[0]
+        h00 = (f_grid[best_i + 1, best_j] - 2 * best_chi2 + f_grid[best_i - 1, best_j]) / dd**2
+        h11 = (f_grid[best_i, best_j + 1] - 2 * best_chi2 + f_grid[best_i, best_j - 1]) / ds**2
+        h01 = (f_grid[best_i + 1, best_j + 1] - f_grid[best_i + 1, best_j - 1]
+               - f_grid[best_i - 1, best_j + 1] + f_grid[best_i - 1, best_j - 1]) / (4 * dd * ds)
+        det = h00 * h11 - h01**2
+        if det > 0 and h00 > 0 and h11 > 0:
+            c00 = h11 / det   # Cov[delta, delta]
+            c11 = h00 / det   # Cov[sigma, sigma]
+            c01 = -h01 / det  # Cov[delta, sigma]
+            if c00 > 0 and c11 > 0:
+                delta_err = float(np.sqrt(c00))
+                sigma_err = float(np.sqrt(c11))
+                corr = float(c01 / np.sqrt(c00 * c11))
+    # Fall back to profile-based errors if Hessian is degenerate
+    if delta_err == 0.0:
+        delta_err = _profile_err(f_delta, f_grid[:, best_j], best_chi2)
+    if sigma_err == 0.0:
+        sigma_err = _profile_err(f_sigma, f_grid[best_i, :], best_chi2)
+
+    chi2_fn([best_delta, best_sigma])  # repopulate last{}
+
+    ndf = max(last["ndf"] - 2, 1)
+    return {
+        "ok": True,
+        "status": 0,
+        "seed": None,
+        "delta": best_delta, "delta_err": delta_err,
+        "sigma": best_sigma, "sigma_err": sigma_err,
+        "chi2": best_chi2, "ndf": ndf,
+        "mu": last["mu"], "width": last["width"],
+        "func": func,
+        "corr": corr,
+    }
+
+
+def _fit_bin_worker(args):
+    """Worker: run one pT bin fit and return a picklable result (no ROOT objects)."""
+    low, high, counts, edges, data, mass_min, mass_max, is_mc, grid_search = args
+    tag = f"{low}_{high}"
+    if grid_search:
+        r = grid_search_bin(data, counts, edges, mass_min, mass_max, is_mc, tag)
+    else:
+        r = fit_bin(data, counts, edges, mass_min, mass_max, is_mc, tag)
+    func = r.pop("func")
+    r["func_params"] = [func.GetParameter(i) for i in range(func.GetNpar())]
+    r["func_xmin"] = func.GetXmin()
+    r["func_xmax"] = func.GetXmax()
+    r["func_npar"] = func.GetNpar()
+    return r
+
+
+def _rebuild_func(r, is_mc, tag):
+    func_def = ROOT.double_sided_cb if is_mc else ROOT.double_sided_cb_plus_bkg
+    func = ROOT.TF1(f"fit_f_{tag}", func_def, r["func_xmin"], r["func_xmax"], r["func_npar"])
+    for i, p in enumerate(r["func_params"]):
+        func.SetParameter(i, p)
+    return func
+
+
+def fit_all_bins(decays, histos, mass_min, mass_max, is_mc, outdir, grid_search=False):
     header = f"{'pt_lo':>6} {'pt_hi':>6} {'delta[MeV]':>14} {'sigma[MeV]':>14} {'chi2/ndf':>10} {'status':>7}"
     print("\n" + header)
     print("-" * len(header))
 
+    # Split bins into those with data and those without
+    valid, skipped_set = [], set()
     for ib, (low, high, counts, edges) in enumerate(histos):
         data = decays[ib]
         if data is None or counts.sum() <= 0:
+            skipped_set.add(ib)
+        else:
+            valid.append((ib, low, high, counts, edges, data))
+
+    # Fit all valid bins in parallel; one worker per bin, pool created once
+    bin_args = [
+        (low, high, counts, edges, data, mass_min, mass_max, is_mc, grid_search)
+        for _, low, high, counts, edges, data in valid
+    ]
+    ctx = mp.get_context("fork")
+    with ProcessPoolExecutor(max_workers=len(bin_args), mp_context=ctx) as pool:
+        raw = list(pool.map(_fit_bin_worker, bin_args))
+
+    raw_by_idx = {ib: r for (ib, *_), r in zip(valid, raw)}
+
+    # ROOT I/O is sequential; print in original bin order
+    results = []
+    for ib, (low, high, counts, edges) in enumerate(histos):
+        if ib in skipped_set:
             print(f"{low:6.2f} {high:6.2f}   (skipped: no stats)")
             continue
 
-        r = fit_bin(data, counts, edges, mass_min, mass_max, is_mc, f"{low}_{high}")
+        r = raw_by_idx[ib]
+        tag = f"{low}_{high}"
+        func = _rebuild_func(r, is_mc, tag)
+        r["func"] = func
         r.update(lo=low, hi=high)
         results.append(r)
 
         centers = 0.5 * (edges[:-1] + edges[1:])
-        model = np.array([r["func"].Eval(c) for c in centers])
-
-        if not is_mc:
-            signal_func = get_signal_func(r["func"])
-            signal_model = np.array([signal_func.Eval(c) for c in centers])
-            bkg_func = get_background_func(r["func"])
-            bkg_model = np.array([bkg_func.Eval(c) for c in centers])
+        model = np.array([func.Eval(c) for c in centers])
 
         suffix = f"pt_{low}_{high}"
         outdir.cd()
         to_th1(f"data_{suffix}", counts, edges).Write()
         to_th1(f"template_{suffix}", model, edges).Write()
-        r["func"].Write(f"fit_func_{suffix}")
+        func.Write(f"fit_func_{suffix}")
+
         if not is_mc:
+            signal_func = get_signal_func(func)
+            signal_model = np.array([signal_func.Eval(c) for c in centers])
+            bkg_func = get_background_func(func)
+            bkg_model = np.array([bkg_func.Eval(c) for c in centers])
             to_th1(f"signal_{suffix}", signal_model, edges).Write()
             to_th1(f"background_{suffix}", bkg_model, edges).Write()
             signal_func.Write(f"fit_signal_func_{suffix}")
@@ -351,14 +529,17 @@ def main(config_path):
 
     print("Loading generated decays (this scans the big tree) ...")
     decays = load_decays(cfg["fit"]["decays"], "decays", pt_bins,
-                         cfg["fit"]["max_per_bin"], cfg["seed"])
+                         cfg["fit"]["max_per_bin"], cfg["seed"],
+                         float(cfg["eta_cut"]), float(cfg["alpha_cut"]),
+                         float(cfg["qt_cut"]))
 
     outfile = ROOT.TFile(cfg["fit"]["output"], "RECREATE")
     for label in ("data", "mc"):
         print(f"\n=== Fitting {label} ===")
         subdir = outfile.mkdir(label)
         results = fit_all_bins(decays, histos[label], mass_min, mass_max,
-                               label == "mc", subdir)
+                               label == "mc", subdir,
+                               grid_search=cfg["fit"].get("grid_search", False))
         write_graphs(results, label, outfile)  # graphs stay in the main folder
 
     outfile.Close()
