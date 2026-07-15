@@ -23,6 +23,11 @@ signal:
     input: Datasets/AO2D_mcArm_679678_2024.root
     output: signal/2024/mc.root
 
+sigma_eta_phi:
+  do: false
+  input: Datasets/AO2D_mcArm_679678_2024.root
+  output: outputs/2024/sigma_eta_phi.root
+
 fit:
   do: true
   inputs:
@@ -31,4 +36,6 @@ fit:
   decays: signal/decays.root
   max_per_bin: 1000000 # Maximum number of decays to use per pT bin (for fitting)
   grid_search: false # Whether to perform a grid search for the fit parameters instead of using a minimizer
-  output: outputs/2024/fit_results.root  
+  fix_sigma_phi_eta_to_mc: true # Whether to fix the sigma_phi and sigma_eta parameters to the RMS from MC
+  file_for_sigma_phi_eta: outputs/2024/sigma_eta_phi.root # File containing the sigma_phi and sigma_eta values to use if fix_sigma_phi_eta_to_mc is true
+  output: outputs/2024/fit_results_eta_phi_fix.root  

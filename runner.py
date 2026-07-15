@@ -35,6 +35,10 @@ def main(config_path):
     if sig["data"]["do"] or sig["mc"]["do"]:
         run([sys.executable, os.path.join(HERE, "signal_producer.py"), config_path])
 
+    if cfg["sigma_eta_phi"]["do"]:
+        run([sys.executable, os.path.join(HERE, "get_sigma_eta_phi.py"),
+             "--config", config_path])
+
     if cfg["fit"]["do"]:
         run([sys.executable, os.path.join(HERE, "fit_resolution.py"),
              "--config", config_path])
