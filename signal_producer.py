@@ -40,12 +40,16 @@ def run_signal(cfg: dict, is_mc: bool):
     df['fENeg'] = np.sqrt(PIMASS**2 + df['fP2Neg'])
     df['fK0sPt'] = np.hypot(df['fPx'], df['fPy'])
     df['fMass'] = np.sqrt((df['fEPos'] + df['fENeg'])**2 - df['fP2'])
+    num = (df['fPxPos']**2 - df['fPxNeg']**2) + (df['fPyPos']**2 - df['fPyNeg']**2) + (df['fPzPos']**2 - df['fPzNeg']**2)
+    den = (df['fPxPos'] + df['fPxNeg'])**2 + (df['fPyPos'] + df['fPyNeg'])**2 + (df['fPzPos'] + df['fPzNeg'])**2
+    df['fAlpha'] = num / den
+    df['fQt'] = np.sqrt((df['fPyPos'] * df['fPz'] - df['fPzPos'] * df['fPy'])**2 + (df['fPzPos'] * df['fPx'] - df['fPxPos'] * df['fPz'])**2 + (df['fPxPos'] * df['fPy'] - df['fPyPos'] * df['fPx'])**2) / np.sqrt(df['fP2'])
 
-    df = df.query(f"fMass > {cfg['mass_min']} and fMass < {cfg['mass_max']} and abs(fEta) < {cfg['eta_cut']}")
+    df = df.query(f"fMass > {cfg['mass_min']} and fMass < {cfg['mass_max']} and abs(fEta) < {cfg['eta_cut']} and abs(fAlpha) < {cfg['alpha_cut']} and fQt > {cfg['qt_cut']}")
 
     with uproot.recreate(output_file) as f:
         for pt_min, pt_max in zip(cfg["pt_bins"][:-1], cfg["pt_bins"][1:]):
-            df_pt = df.query(f"fK0sPt > {pt_min} and fK0sPt < {pt_max}")
+            df_pt = df.query(f"fPtPos > {pt_min} and fPtPos < {pt_max}")
             bins = (cfg["mass_max"] - cfg["mass_min"]) * 2000
             hist_mass = np.histogram(df_pt["fMass"], bins=100, range=(cfg["mass_min"], cfg["mass_max"]))
             f[f"mass_pt_{pt_min}_{pt_max}"] = hist_mass
